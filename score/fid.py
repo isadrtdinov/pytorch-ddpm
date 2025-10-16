@@ -2,7 +2,6 @@ import numpy as np
 import torch
 from scipy import linalg
 from tqdm import tqdm
-from torch.nn.functional import adaptive_avg_pool2d
 
 from .inception import InceptionV3
 

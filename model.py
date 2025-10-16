@@ -34,6 +34,7 @@ class TimeEmbedding(nn.Module):
     def __init__(self, d_model, dim):
         assert d_model % 2 == 0
         super().__init__()
+        self.d_model = d_model
         self.time_emb = torch.nn.Sequential(
             nn.Linear(d_model, dim),
             nn.SiLU(),
@@ -48,7 +49,7 @@ class TimeEmbedding(nn.Module):
                 init.zeros_(module.bias)
 
     def forward(self, t):
-        emb = self.time_emb(t)
+        emb = self.time_emb(timestep_embedding(t, dim=self.d_model))
         return emb
 
 
@@ -169,13 +170,13 @@ class ResBlock(nn.Module):
 
 
 class UNet(nn.Module):
-    def __init__(self, ch, ch_mult, attn, num_res_blocks, dropout):
+    def __init__(self, img_ch, ch, ch_mult, attn, num_res_blocks, dropout):
         super().__init__()
         assert all([i < len(ch_mult) for i in attn]), 'attn index out of bound'
         tdim = ch * 4
         self.time_embedding = TimeEmbedding(ch, tdim)
 
-        self.head = nn.Conv2d(3, ch, kernel_size=3, stride=1, padding=1)
+        self.head = nn.Conv2d(img_ch, ch, kernel_size=3, stride=1, padding=1)
         self.downblocks = nn.ModuleList()
         chs = [ch]  # record output channel when dowmsample for upsample
         now_ch = ch
@@ -211,7 +212,7 @@ class UNet(nn.Module):
         self.tail = nn.Sequential(
             nn.GroupNorm(32, now_ch),
             Swish(),
-            nn.Conv2d(now_ch, 3, 3, stride=1, padding=1)
+            nn.Conv2d(now_ch, img_ch, 3, stride=1, padding=1)
         )
         self.initialize()
 
@@ -247,7 +248,7 @@ class UNet(nn.Module):
 if __name__ == '__main__':
     batch_size = 8
     model = UNet(
-        T=1000, ch=128, ch_mult=[1, 2, 2, 2], attn=[1],
+        img_ch=3, ch=128, ch_mult=[1, 2, 2, 2], attn=[1],
         num_res_blocks=2, dropout=0.1)
     x = torch.randn(batch_size, 3, 32, 32)
     t = torch.randint(1000, (batch_size, ))

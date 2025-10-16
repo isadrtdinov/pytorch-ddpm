@@ -35,10 +35,10 @@ def get_inception_and_fid_score(images, fid_cache, num_images=None,
 
     if use_torch:
         fid_acts = torch.empty((num_images, 2048)).to(device)
-        is_probs = torch.empty((num_images, 1008)).to(device)
+        is_probs = torch.empty((num_images, 1000)).to(device)
     else:
         fid_acts = np.empty((num_images, 2048))
-        is_probs = np.empty((num_images, 1008))
+        is_probs = np.empty((num_images, 1000))
 
     iterator = iter(tqdm(
         images, total=num_images,

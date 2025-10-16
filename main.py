@@ -12,6 +12,7 @@ from torchvision import transforms
 from tqdm import trange
 
 from diffusion import GaussianDiffusionTrainer, GaussianDiffusionSampler
+from mnist import get_mnist_dataset
 from model import UNet
 from score.both import get_inception_and_fid_score
 
@@ -26,12 +27,11 @@ flags.DEFINE_multi_integer('attn', [1], help='add attention to these levels')
 flags.DEFINE_integer('num_res_blocks', 2, help='# resblock in each level')
 flags.DEFINE_float('dropout', 0.1, help='dropout rate of resblock')
 # Gaussian Diffusion
-flags.DEFINE_float('beta_1', 1e-4, help='start beta value')
-flags.DEFINE_float('beta_T', 0.02, help='end beta value')
-flags.DEFINE_integer('T', 1000, help='total diffusion steps')
+flags.DEFINE_integer('T', 1000, help='total diffusion steps during sampling')
 flags.DEFINE_enum('mean_type', 'epsilon', ['xprev', 'xstart', 'epsilon'], help='predict variable')
 flags.DEFINE_enum('var_type', 'fixedlarge', ['fixedlarge', 'fixedsmall'], help='variance type')
 # Training
+flags.DEFINE_string('dataset', default='cifar10', help='dataset name')
 flags.DEFINE_float('lr', 2e-4, help='target learning rate')
 flags.DEFINE_float('grad_clip', 1., help="gradient norm clipping")
 flags.DEFINE_integer('total_steps', 800000, help='total training steps')
@@ -43,7 +43,7 @@ flags.DEFINE_float('ema_decay', 0.9999, help="ema decay rate")
 flags.DEFINE_bool('parallel', False, help='multi gpu training')
 # Logging & Sampling
 flags.DEFINE_bool('use_wandb', True, help='whether to log to wandb')
-flags.DEFINE_integer('log_steps', 100, help='frequency of logging training loss')
+flags.DEFINE_integer('log_step', 100, help='frequency of logging training loss')
 flags.DEFINE_string('logdir', './logs/DDPM_CIFAR10_EPS', help='log directory')
 flags.DEFINE_integer('sample_size', 64, "sampling size of images")
 flags.DEFINE_integer('sample_step', 1000, help='frequency of sampling')
@@ -102,14 +102,21 @@ def train():
             config={name: FLAGS[name].value for name in FLAGS}
         )
 
+    transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
+
     # dataset
-    dataset = CIFAR10(
-        root='./data', train=True, download=True,
-        transform=transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-        ]))
+    if 'cifar10' in FLAGS.dataset:
+        dataset = CIFAR10(root='./data', train=True, download=True, transform=transform)
+    elif 'mnist' in FLAGS.dataset:
+        dataset = get_mnist_dataset(
+            FLAGS.dataset, root='./data', transform=transform, img_size=FLAGS.img_size)
+    else:
+        raise ValueError('Unsupported dataset')
+
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=FLAGS.batch_size, shuffle=True,
         num_workers=FLAGS.num_workers, drop_last=True)
@@ -117,9 +124,10 @@ def train():
 
     # model setup
     net_model = UNet(
+        img_ch=1 if 'mnist' in FLAGS.dataset else 3,
         ch=FLAGS.ch, ch_mult=FLAGS.ch_mult, attn=FLAGS.attn,
         num_res_blocks=FLAGS.num_res_blocks, dropout=FLAGS.dropout)
-    ema_model = copy.deepcopy(net_model)
+    ema_model = copy.deepcopy(net_model).to(device)
     optim = torch.optim.Adam(net_model.parameters(), lr=FLAGS.lr)
     sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
     trainer = GaussianDiffusionTrainer(net_model).to(device)
@@ -138,7 +146,6 @@ def train():
     os.makedirs(os.path.join(FLAGS.logdir, 'sample'))
     x_T = torch.randn(FLAGS.sample_size, 3, FLAGS.img_size, FLAGS.img_size)
     x_T = x_T.to(device)
-    grid = (make_grid(next(iter(dataloader))[0][:FLAGS.sample_size]) + 1) / 2
 
     # backup all arguments
     with open(os.path.join(FLAGS.logdir, "flagfile.txt"), 'w') as f:
@@ -164,7 +171,7 @@ def train():
             ema(net_model, ema_model, FLAGS.ema_decay)
 
             # log
-            if FLAGS.use_wadnb and step % FLAGS.log_step == 0:
+            if FLAGS.use_wandb and step % FLAGS.log_step == 0:
                 wandb.log({
                     'loss': loss.item(),
                     'iteration': step,
@@ -174,17 +181,18 @@ def train():
             # sample
             if FLAGS.sample_step > 0 and step % FLAGS.sample_step == 0:
                 net_model.eval()
-                with torch.no_grad():
-                    x_0 = ema_sampler(x_T)
+                log_dict = {'iteration': step}
+                for solver in ['ddpm', 'ddim', 'jumping']:
+                    with torch.no_grad():
+                        x_0 = ema_sampler(x_T, solver=solver)
+
                     grid = (make_grid(x_0) + 1) / 2
-                    path = os.path.join(
-                        FLAGS.logdir, 'sample', '%d.png' % step)
+                    path = os.path.join(FLAGS.logdir, f'{solver}_sample', '%d.png' % step)
                     save_image(grid, path)
-                    if FLAGS.use_wadnb:
-                        wandb.log({
-                            'ema_samples': wandb.Image(grid),
-                            'iteration': step,
-                        })
+                    log_dict[f'{solver}_sample'] = wandb.Image(grid)
+
+                if FLAGS.use_wandb:
+                    wandb.log(log_dict)
                 net_model.train()
 
             # save
@@ -228,6 +236,7 @@ def train():
 def eval():
     # model setup
     model = UNet(
+        img_ch=1 if 'mnist' in FLAGS.dataset else 3,
         ch=FLAGS.ch, ch_mult=FLAGS.ch_mult, attn=FLAGS.attn,
         num_res_blocks=FLAGS.num_res_blocks, dropout=FLAGS.dropout)
     sampler = GaussianDiffusionSampler(
