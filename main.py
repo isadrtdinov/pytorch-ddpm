@@ -3,9 +3,9 @@ import json
 import os
 import warnings
 
+import wandb
 import torch
 from absl import app, flags
-from tensorboardX import SummaryWriter
 from torchvision.datasets import CIFAR10
 from torchvision.utils import make_grid, save_image
 from torchvision import transforms
@@ -42,12 +42,14 @@ flags.DEFINE_integer('num_workers', 4, help='workers of Dataloader')
 flags.DEFINE_float('ema_decay', 0.9999, help="ema decay rate")
 flags.DEFINE_bool('parallel', False, help='multi gpu training')
 # Logging & Sampling
+flags.DEFINE_bool('use_wandb', True, help='whether to log to wandb')
+flags.DEFINE_integer('log_steps', 100, help='frequency of logging training loss')
 flags.DEFINE_string('logdir', './logs/DDPM_CIFAR10_EPS', help='log directory')
 flags.DEFINE_integer('sample_size', 64, "sampling size of images")
 flags.DEFINE_integer('sample_step', 1000, help='frequency of sampling')
 # Evaluation
 flags.DEFINE_integer('save_step', 5000, help='frequency of saving checkpoints, 0 to disable during training')
-flags.DEFINE_integer('eval_step', 0, help='frequency of evaluating model, 0 to disable during training')
+flags.DEFINE_integer('eval_step', 5000, help='frequency of evaluating model, 0 to disable during training')
 flags.DEFINE_integer('num_images', 50000, help='the number of generated images for evaluation')
 flags.DEFINE_bool('fid_use_torch', False, help='calculate IS and FID on gpu')
 flags.DEFINE_string('fid_cache', './stats/cifar10.train.npz', help='FID cache')
@@ -74,7 +76,7 @@ def warmup_lr(step):
     return min(step, FLAGS.warmup) / FLAGS.warmup
 
 
-def evaluate(sampler, model):
+def evaluate(sampler, model, solver='ddpm'):
     model.eval()
     with torch.no_grad():
         images = []
@@ -82,7 +84,7 @@ def evaluate(sampler, model):
         for i in trange(0, FLAGS.num_images, FLAGS.batch_size, desc=desc):
             batch_size = min(FLAGS.batch_size, FLAGS.num_images - i)
             x_T = torch.randn((batch_size, 3, FLAGS.img_size, FLAGS.img_size))
-            batch_images = sampler(x_T.to(device)).cpu()
+            batch_images = sampler(x_T.to(device), solver=solver).cpu()
             images.append((batch_images + 1) / 2)
         images = torch.cat(images, dim=0).numpy()
     model.train()
@@ -93,6 +95,13 @@ def evaluate(sampler, model):
 
 
 def train():
+    if FLAGS.use_wandb:
+        wandb.init(
+            project='ImageDiffusionSolvers',
+            name='CIFAR10',
+            config={name: FLAGS[name].value for name in FLAGS}
+        )
+
     # dataset
     dataset = CIFAR10(
         root='./data', train=True, download=True,
@@ -108,19 +117,18 @@ def train():
 
     # model setup
     net_model = UNet(
-        T=FLAGS.T, ch=FLAGS.ch, ch_mult=FLAGS.ch_mult, attn=FLAGS.attn,
+        ch=FLAGS.ch, ch_mult=FLAGS.ch_mult, attn=FLAGS.attn,
         num_res_blocks=FLAGS.num_res_blocks, dropout=FLAGS.dropout)
     ema_model = copy.deepcopy(net_model)
     optim = torch.optim.Adam(net_model.parameters(), lr=FLAGS.lr)
     sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
-    trainer = GaussianDiffusionTrainer(
-        net_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T).to(device)
+    trainer = GaussianDiffusionTrainer(net_model).to(device)
     net_sampler = GaussianDiffusionSampler(
-        net_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, FLAGS.img_size,
-        FLAGS.mean_type, FLAGS.var_type).to(device)
+        net_model, T=FLAGS.T, img_size=FLAGS.img_size,
+        mean_type=FLAGS.mean_type, var_type=FLAGS.var_type).to(device)
     ema_sampler = GaussianDiffusionSampler(
-        ema_model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, FLAGS.img_size,
-        FLAGS.mean_type, FLAGS.var_type).to(device)
+        net_model, T=FLAGS.T, img_size=FLAGS.img_size,
+        mean_type=FLAGS.mean_type, var_type=FLAGS.var_type).to(device)
     if FLAGS.parallel:
         trainer = torch.nn.DataParallel(trainer)
         net_sampler = torch.nn.DataParallel(net_sampler)
@@ -131,9 +139,7 @@ def train():
     x_T = torch.randn(FLAGS.sample_size, 3, FLAGS.img_size, FLAGS.img_size)
     x_T = x_T.to(device)
     grid = (make_grid(next(iter(dataloader))[0][:FLAGS.sample_size]) + 1) / 2
-    writer = SummaryWriter(FLAGS.logdir)
-    writer.add_image('real_sample', grid)
-    writer.flush()
+
     # backup all arguments
     with open(os.path.join(FLAGS.logdir, "flagfile.txt"), 'w') as f:
         f.write(FLAGS.flags_into_string())
@@ -144,7 +150,7 @@ def train():
     print('Model params: %.2f M' % (model_size / 1024 / 1024))
 
     # start training
-    with trange(FLAGS.total_steps, dynamic_ncols=True) as pbar:
+    with trange(1, FLAGS.total_steps + 1, dynamic_ncols=True) as pbar:
         for step in pbar:
             # train
             optim.zero_grad()
@@ -158,7 +164,11 @@ def train():
             ema(net_model, ema_model, FLAGS.ema_decay)
 
             # log
-            writer.add_scalar('loss', loss, step)
+            if FLAGS.use_wadnb and step % FLAGS.log_step == 0:
+                wandb.log({
+                    'loss': loss.item(),
+                    'iteration': step,
+                })
             pbar.set_postfix(loss='%.3f' % loss)
 
             # sample
@@ -170,7 +180,11 @@ def train():
                     path = os.path.join(
                         FLAGS.logdir, 'sample', '%d.png' % step)
                     save_image(grid, path)
-                    writer.add_image('sample', grid, step)
+                    if FLAGS.use_wadnb:
+                        wandb.log({
+                            'ema_samples': wandb.Image(grid),
+                            'iteration': step,
+                        })
                 net_model.train()
 
             # save
@@ -187,35 +201,37 @@ def train():
 
             # evaluate
             if FLAGS.eval_step > 0 and step % FLAGS.eval_step == 0:
-                net_IS, net_FID, _ = evaluate(net_sampler, net_model)
-                ema_IS, ema_FID, _ = evaluate(ema_sampler, ema_model)
-                metrics = {
-                    'IS': net_IS[0],
-                    'IS_std': net_IS[1],
-                    'FID': net_FID,
-                    'IS_EMA': ema_IS[0],
-                    'IS_std_EMA': ema_IS[1],
-                    'FID_EMA': ema_FID
-                }
+                metrics = {'iteration': step}
+                for solver in ['ddpm', 'ddim', 'jumping']:
+                    net_IS, net_FID, _ = evaluate(net_sampler, net_model, solver)
+                    ema_IS, ema_FID, _ = evaluate(ema_sampler, ema_model, solver)
+                    metrics.update({
+                        f'{solver}/IS': net_IS[0],
+                        f'{solver}/IS_std': net_IS[1],
+                        f'{solver}/FID': net_FID,
+                        f'{solver}/IS_EMA': ema_IS[0],
+                        f'{solver}/IS_std_EMA': ema_IS[1],
+                        f'{solver}/FID_EMA': ema_FID
+                    })
+
+                if FLAGS.use_wandb:
+                    wandb.log(metrics)
+
                 pbar.write(
                     "%d/%d " % (step, FLAGS.total_steps) +
                     ", ".join('%s:%.3f' % (k, v) for k, v in metrics.items()))
-                for name, value in metrics.items():
-                    writer.add_scalar(name, value, step)
-                writer.flush()
+
                 with open(os.path.join(FLAGS.logdir, 'eval.txt'), 'a') as f:
-                    metrics['step'] = step
                     f.write(json.dumps(metrics) + "\n")
-    writer.close()
 
 
 def eval():
     # model setup
     model = UNet(
-        T=FLAGS.T, ch=FLAGS.ch, ch_mult=FLAGS.ch_mult, attn=FLAGS.attn,
+        ch=FLAGS.ch, ch_mult=FLAGS.ch_mult, attn=FLAGS.attn,
         num_res_blocks=FLAGS.num_res_blocks, dropout=FLAGS.dropout)
     sampler = GaussianDiffusionSampler(
-        model, FLAGS.beta_1, FLAGS.beta_T, FLAGS.T, img_size=FLAGS.img_size,
+        model, T=FLAGS.T, img_size=FLAGS.img_size,
         mean_type=FLAGS.mean_type, var_type=FLAGS.var_type).to(device)
     if FLAGS.parallel:
         sampler = torch.nn.DataParallel(sampler)

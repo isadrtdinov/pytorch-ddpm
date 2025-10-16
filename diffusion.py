@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,39 +13,54 @@ def extract(v, t, x_shape):
     return out.view([t.shape[0]] + [1] * (len(x_shape) - 1))
 
 
+def continuous_extract(v, t, x_shape):
+    """
+    Apply function at specified timesteps, then reshape to
+    [batch_size, 1, 1, 1, 1, ...] for broadcasting purposes.
+    """
+    out = v(t)
+    return out.view([t.shape[0]] + [1] * (len(x_shape) - 1))
+
+
+s = 0.008
+def cosine_schedule(t):
+    """
+    Function implementing cosine diffusion schedule.
+    Parameters
+    ----------
+    t - tensor of timesteps from [0, 1]
+    Returns
+    -------
+    Tensor of \bar{\alpha}_t values
+    """
+    return (
+        torch.cos((t + s) / (1 + s) * math.pi / 2) ** 2 /
+        math.cos(s / (1 + s) * math.pi / 2) ** 2
+    )
+
+
 class GaussianDiffusionTrainer(nn.Module):
-    def __init__(self, model, beta_1, beta_T, T):
+    def __init__(self, model):
         super().__init__()
 
         self.model = model
-        self.T = T
-
-        self.register_buffer(
-            'betas', torch.linspace(beta_1, beta_T, T).double())
-        alphas = 1. - self.betas
-        alphas_bar = torch.cumprod(alphas, dim=0)
 
         # calculations for diffusion q(x_t | x_{t-1}) and others
-        self.register_buffer(
-            'sqrt_alphas_bar', torch.sqrt(alphas_bar))
-        self.register_buffer(
-            'sqrt_one_minus_alphas_bar', torch.sqrt(1. - alphas_bar))
+        self.sqrt_alphas_bar = lambda t: cosine_schedule(t).sqrt()
+        self.sqrt_one_minus_alphas_bar = lambda t: (1 - cosine_schedule(t)).sqrt()
 
     def forward(self, x_0):
-        """
-        Algorithm 1.
-        """
-        t = torch.randint(self.T, size=(x_0.shape[0], ), device=x_0.device)
+        t = torch.rand(size=(x_0.shape[0], ), device=x_0.device)
         noise = torch.randn_like(x_0)
         x_t = (
-            extract(self.sqrt_alphas_bar, t, x_0.shape) * x_0 +
-            extract(self.sqrt_one_minus_alphas_bar, t, x_0.shape) * noise)
+            continuous_extract(self.sqrt_alphas_bar, t, x_0.shape) * x_0 +
+            continuous_extract(self.sqrt_one_minus_alphas_bar, t, x_0.shape) * noise)
         loss = F.mse_loss(self.model(x_t, t), noise, reduction='none')
         return loss
 
 
 class GaussianDiffusionSampler(nn.Module):
-    def __init__(self, model, beta_1, beta_T, T, img_size=32,
+    def __init__(self, model, T, img_size=32,
                  mean_type='eps', var_type='fixedlarge'):
         assert mean_type in ['xprev' 'xstart', 'epsilon']
         assert var_type in ['fixedlarge', 'fixedsmall']
@@ -57,10 +73,18 @@ class GaussianDiffusionSampler(nn.Module):
         self.var_type = var_type
 
         self.register_buffer(
-            'betas', torch.linspace(beta_1, beta_T, T).double())
-        alphas = 1. - self.betas
-        alphas_bar = torch.cumprod(alphas, dim=0)
+            'ts', torch.linspace(0, 1, T))
+        alphas_bar = cosine_schedule(self.ts)
         alphas_bar_prev = F.pad(alphas_bar, [1, 0], value=1)[:T]
+        alphas = alphas_bar / alphas_bar_prev
+        self.register_buffer(
+            'betas', 1. - alphas)
+
+        # calculations for forward process q(x_t | x_0)
+        self.register_buffer(
+            'sqrt_alphas_bar_prev', torch.sqrt(alphas_bar_prev))
+        self.register_buffer(
+            'sqrt_one_minus_alphas_bar_prev', torch.sqrt(1. - alphas_bar_prev))
 
         # calculations for diffusion q(x_t | x_{t-1}) and others
         self.register_buffer(
@@ -116,6 +140,21 @@ class GaussianDiffusionSampler(nn.Module):
                 x_t.shape) * x_t
         )
 
+    def predict_eps_from_xstart(self, x_t, t, x_0):
+        assert x_t.shape == x_0.shape
+        return (
+            extract(
+                self.sqrt_recip_alphas_bar / self.sqrt_recipm1_alphas_bar, t, x_t.shape) * x_t -
+            extract(1 / self.sqrt_recipm1_alphas_bar, t, x_t.shape) * x_0
+        )
+
+    def predict_eps_from_xprev(self, x_t, t, xprev):
+        assert x_t.shape == xprev.shape
+        return (
+            extract(1 / self.betas.sqrt(), t, x_t.shape) * x_t -
+            extract(((1 - self.betas) / self.betas).sqrt(), t, x_t.shape) * xprev
+        )
+
     def p_mean_variance(self, x_t, t):
         # below: only log_variance is used in the KL computations
         model_log_var = {
@@ -129,35 +168,45 @@ class GaussianDiffusionSampler(nn.Module):
 
         # Mean parameterization
         if self.mean_type == 'xprev':       # the model predicts x_{t-1}
-            x_prev = self.model(x_t, t)
+            x_prev = self.model(x_t, t / self.T)
             x_0 = self.predict_xstart_from_xprev(x_t, t, xprev=x_prev)
             model_mean = x_prev
+            eps = self.predict_eps_from_xprev(x_t, t, xprev=x_prev)
         elif self.mean_type == 'xstart':    # the model predicts x_0
-            x_0 = self.model(x_t, t)
+            x_0 = self.model(x_t, t / self.T)
             model_mean, _ = self.q_mean_variance(x_0, x_t, t)
+            eps = self.predict_eps_from_xstart(x_t, t, x_0)
         elif self.mean_type == 'epsilon':   # the model predicts epsilon
-            eps = self.model(x_t, t)
+            eps = self.model(x_t, t / self.T)
             x_0 = self.predict_xstart_from_eps(x_t, t, eps=eps)
             model_mean, _ = self.q_mean_variance(x_0, x_t, t)
         else:
             raise NotImplementedError(self.mean_type)
-        x_0 = torch.clip(x_0, -1., 1.)
+        # x_0 = torch.clip(x_0, -1., 1.)
 
-        return model_mean, model_log_var
+        return x_0, eps, model_mean, model_log_var
 
-    def forward(self, x_T):
-        """
-        Algorithm 2.
-        """
+    def forward(self, x_T, solver='ddpm'):
+        assert solver in ['ddpm', 'ddim', 'jumping']
         x_t = x_T
         for time_step in reversed(range(self.T)):
             t = x_t.new_ones([x_T.shape[0], ], dtype=torch.long) * time_step
-            mean, log_var = self.p_mean_variance(x_t=x_t, t=t)
+            x_0, eps, mean, log_var = self.p_mean_variance(x_t=x_t, t=t)
             # no noise when t == 0
             if time_step > 0:
                 noise = torch.randn_like(x_t)
             else:
                 noise = 0
-            x_t = mean + torch.exp(0.5 * log_var) * noise
+
+            if solver == 'ddpm':
+                x_t = mean + torch.exp(0.5 * log_var) * noise
+            elif solver in ['ddim', 'jumping']:
+                if solver == 'ddim' and time_step > 0:
+                    noise = eps
+                x_t = (
+                    extract(self.sqrt_alphas_bar_prev, t, x_t.shape) * x_0 +
+                    extract(self.sqrt_one_minus_alphas_bar_prev, t, x_t.shape) * noise
+                )
+
         x_0 = x_t
         return torch.clip(x_0, -1, 1)

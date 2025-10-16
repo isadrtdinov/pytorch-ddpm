@@ -6,3 +6,5 @@ logs
 
 .python-version
 __pycache__
+.idea/
+*-venv/

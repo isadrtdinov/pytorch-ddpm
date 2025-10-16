@@ -10,24 +10,34 @@ class Swish(nn.Module):
         return x * torch.sigmoid(x)
 
 
+def timestep_embedding(timesteps, dim, max_period=10000):
+    """
+    create sinusoidal timestep embeddings.
+    :param timesteps: a 1-D Tensor of N indices, one per batch element.
+                      these may be fractional.
+    :param dim: the dimension of the output.
+    :param max_period: controls the minimum frequency of the embeddings.
+    :return: an [N x dim] Tensor of positional embeddings.
+    """
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+    ).to(device=timesteps.device)
+    args = timesteps[:, None].float() * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2:
+        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    return embedding
+
+
 class TimeEmbedding(nn.Module):
-    def __init__(self, T, d_model, dim):
+    def __init__(self, d_model, dim):
         assert d_model % 2 == 0
         super().__init__()
-        emb = torch.arange(0, d_model, step=2) / d_model * math.log(10000)
-        emb = torch.exp(-emb)
-        pos = torch.arange(T).float()
-        emb = pos[:, None] * emb[None, :]
-        assert list(emb.shape) == [T, d_model // 2]
-        emb = torch.stack([torch.sin(emb), torch.cos(emb)], dim=-1)
-        assert list(emb.shape) == [T, d_model // 2, 2]
-        emb = emb.view(T, d_model)
-
-        self.timembedding = nn.Sequential(
-            nn.Embedding.from_pretrained(emb),
+        self.time_emb = torch.nn.Sequential(
             nn.Linear(d_model, dim),
-            Swish(),
-            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim)
         )
         self.initialize()
 
@@ -38,7 +48,7 @@ class TimeEmbedding(nn.Module):
                 init.zeros_(module.bias)
 
     def forward(self, t):
-        emb = self.timembedding(t)
+        emb = self.time_emb(t)
         return emb
 
 
@@ -159,11 +169,11 @@ class ResBlock(nn.Module):
 
 
 class UNet(nn.Module):
-    def __init__(self, T, ch, ch_mult, attn, num_res_blocks, dropout):
+    def __init__(self, ch, ch_mult, attn, num_res_blocks, dropout):
         super().__init__()
         assert all([i < len(ch_mult) for i in attn]), 'attn index out of bound'
         tdim = ch * 4
-        self.time_embedding = TimeEmbedding(T, ch, tdim)
+        self.time_embedding = TimeEmbedding(ch, tdim)
 
         self.head = nn.Conv2d(3, ch, kernel_size=3, stride=1, padding=1)
         self.downblocks = nn.ModuleList()
