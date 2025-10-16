@@ -98,7 +98,7 @@ def train():
     if FLAGS.use_wandb:
         wandb.init(
             project='ImageDiffusionSolvers',
-            name='CIFAR10',
+            name=f'{FLAGS.dataset}',
             config={name: FLAGS[name].value for name in FLAGS}
         )
 
