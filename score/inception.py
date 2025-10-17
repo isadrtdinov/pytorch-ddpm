@@ -156,6 +156,10 @@ class InceptionV3(nn.Module):
         outp = []
         x = inp
 
+        # in the case of MNIST images, duplicate color channels
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+
         if self.resize_input:
             x = F.interpolate(x,
                               size=(299, 299),

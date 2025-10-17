@@ -1,6 +1,8 @@
+import numpy as np
 import torch
 from torchvision.datasets import MNIST
-from torchvision.transforms import Resize
+from torchvision.transforms import Resize, ToTensor
+from score import fid
 
 
 def get_mnist_dataset(dataset_name, root, transform, img_size):
@@ -51,3 +53,13 @@ def get_mnist_dataset(dataset_name, root, transform, img_size):
         dataset = torch.utils.data.Subset(dataset, subset_indices)
 
     return dataset
+
+
+def get_mnist_statistics(dataset_name, root):
+    dataset = get_mnist_dataset(dataset_name, root, transform=ToTensor(), img_size=32)
+    def dataset_generator():
+        for image, label in dataset:
+            yield image
+
+    m, s = fid.get_statistics(dataset_generator, num_images=len(dataset), batch_size=1024)
+    np.savez(f'./stats/{dataset_name}.train.npz', mu=m, sigma=s)
